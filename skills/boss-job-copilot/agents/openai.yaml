@@ -1,0 +1,4 @@
+interface:
+  display_name: "BOSS 求职助手"
+  short_description: "从简历和项目分析职业画像，确认求职策略后筛选岗位并在授权后沟通"
+  default_prompt: "使用 $boss-job-copilot 分析我的简历与项目，先展示职业画像、求职策略和招呼参考稿供我确认，再收集岗位、校准首批结果并按我的授权继续沟通。"
