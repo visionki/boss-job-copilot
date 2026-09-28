@@ -7,11 +7,12 @@ import os
 import subprocess
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from .local import ACTIVITY_WAITING, FileLock, RUNTIME_VERSION, Stopped, Workspace, database, digest, now, page_interval, parse_response, read_json, search_url, write_json
-from .page import READ_PAGE, check_profile_available, detail_state, make_driver_config, page_problem, separate_company_text
+from .page import READ_PAGE, check_profile_available, contact_limit_feedback, detail_state, make_driver_config, page_error, page_problem, separate_company_text
 from .catalog import READ_CATALOG, READ_LIST_STATE, clean_region, merge_view
 from .filters import compile_plan, finish_region, load_catalog, request_matches, request_params
 from .browser_process import chrome_processes, kill_owned_chrome
@@ -72,7 +73,7 @@ class Pace:
         data["actions"] = [t for t in data.get("actions", []) if clock - t < 86400] + [clock]
         write_json(self.path, data)
 
-    def block(self, reason):
+    def block(self, reason, contact_limit=None):
         # A missing/blank tab is not evidence of a login or security challenge.
         if not manual_check_required(reason):
             return
@@ -81,12 +82,25 @@ class Pace:
         if data.get("blocked") and (data["blocked"] == "verification_required" or reason != "verification_required"):
             return
         data.update(blocked=reason, blocked_at=time.time())
+        if contact_limit:
+            data['contact_limit'] = contact_limit
         write_json(self.path, data)
+
+    def daily_limit_today(self):
+        data = read_json(self.path, {})
+        if data.get('blocked') != 'platform_contact_limit_daily':
+            return None
+        china = timezone(timedelta(hours=8))
+        observed = datetime.fromtimestamp(data.get('blocked_at', time.time()), china).date()
+        if datetime.fromtimestamp(time.time(), china).date() <= observed:
+            return data.get('contact_limit') or {'reason': data['blocked'], 'daily': True}
+        return None  # Only an explicit healthy check may clear a previous day's block.
 
     def clear(self):
         data = read_json(self.path, {})
         data.pop("blocked", None)
         data.pop("blocked_at", None)
+        data.pop('contact_limit', None)
         write_json(self.path, data)
 
     def clear_legacy_page_block(self):
@@ -214,18 +228,22 @@ class BrowserSession:
     async def check(self):
         page = await self.read()
         reason = page_problem(page)
+        limit = page.get('contact_limit')
         self.pace.clear_legacy_page_block()
         if reason in ("blank_or_redirected", "login_unconfirmed"):
             blocked = read_json(self.pace.path, {}).get("blocked")
             return {"login": "not_checked", "reason": reason, "url": page.get("url"), "title": page.get("title"),
                     "needs_manual_action": bool(blocked), "blocked_reason": blocked,
                     "next_action": "handle_previous_block_then_check" if blocked else "open_boss_home_then_check"}
+        if not reason and (limit := self.pace.daily_limit_today()):
+            reason = limit['reason']  # Dismissing the dialog does not restore today's quota.
         if reason:
-            self.pace.block(reason)
+            self.pace.block(reason, contact_limit=limit)
         else:
             self.pace.clear()
         return {"login": "confirmed" if not reason else reason,
-                "url": page.get("url"), "title": page.get("title"), "needs_manual_action": bool(reason)}
+                "url": page.get("url"), "title": page.get("title"), "needs_manual_action": bool(reason),
+                **contact_limit_feedback(reason or '', limit)}
 
     async def open_home(self):
         await self.prepare_tab(create=True)
@@ -259,7 +277,7 @@ class BrowserSession:
         page = await self.read()
         problem = page_problem(page)
         if problem and problem != "job_unavailable":
-            raise Stopped(problem)
+            raise page_error(page, problem)
         return page
 
     async def settle(self, after_page=None, detail_id=None, timeout=20, expected_path=None, previous_document=None):
@@ -276,7 +294,7 @@ class BrowserSession:
                 if problem == "job_unavailable" and detail_id:
                     return page
                 if problem not in (None, "blank_or_redirected", "login_unconfirmed"):
-                    raise Stopped(problem)
+                    raise page_error(page, problem)
                 navigation_ready = ((expected_path is None or urlsplit(page.get("url", "")).path.rstrip("/") == expected_path)
                                     and (previous_document is None or page.get("document_id") != previous_document))
                 if not problem and navigation_ready:
@@ -295,7 +313,7 @@ class BrowserSession:
             if detail_id and page is not None:
                 return page  # Preserve partial content; details() will stop this request.
             if page is not None and page_problem(page):
-                raise Stopped(page_problem(page))
+                raise page_error(page, page_problem(page))
             raise Stopped("no_matching_list_response" if after_page == 0 else
                           "list_pagination_stalled" if after_page is not None else "page_load_timeout")
 
@@ -569,7 +587,7 @@ class BrowserSession:
                 page = await self.settle(detail_id=job["id"])
                 problem = page_problem(page)
                 if problem and session_blocking(problem):
-                    raise Stopped(problem)
+                    raise page_error(page, problem)
                 state = "unavailable" if problem == "job_unavailable" else detail_state(page, job["id"])
                 detail = {k: page.get(k) for k in ("url", "job_detail", "company_info", "work_address", "chat_button", "recruiter_active_label")}
                 detail["problem"] = problem
@@ -684,10 +702,13 @@ async def serve(workspace, url=None):
                 except Exception as exc:
                     reason = "browser_operation_timeout" if isinstance(exc, asyncio.TimeoutError) else str(exc) if isinstance(exc, Stopped) else type(exc).__name__
                     blocked = manual_check_required(reason)
+                    limit = getattr(exc, 'limit', None)
                     if blocked:
-                        session.pace.block(reason)
+                        session.pace.block(reason, contact_limit=limit)
+                    limit = limit or read_json(session.pace.path, {}).get('contact_limit')
                     result = {"state": "stopped", "reason": reason, "needs_manual_check": blocked,
-                              "next_action": "recover_browser_then_check" if browser_problem(reason) or reason == "blank_or_redirected" else "review_local_database"}
+                              "next_action": "recover_browser_then_check" if browser_problem(reason) or reason == "blank_or_redirected" else "review_local_database",
+                              **contact_limit_feedback(reason, limit)}
                 if session.collection_progress is not None:
                     if result["state"] != "completed":
                         session.collection_progress.update(state="stopped",reason=result.get("reason"))

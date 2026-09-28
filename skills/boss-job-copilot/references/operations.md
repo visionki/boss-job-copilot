@@ -79,6 +79,8 @@ PY BOSS --workspace W result --id <请求ID>
 
 collect/details/send 等页面动作默认串行间隔至少 5 秒；数据已就绪即可继续，没有小时/每日配额或总时长上限。本地查询、分析、保存无需等待。网页明确限发、访问拒绝、验证或未登录时停止网页；用户处理后显式 check 恢复。局部解析或详情失败继续其他候选；采集允许缺页，别为了补齐而耽误本地审查。
 
+`platform_contact_limit_daily`（后续请求可能带 `manual_check_required:` 前缀）表示平台已明确提示当日沟通上限。读取返回的 `contact_limit` 与 `user_message` 告知用户，停止本轮网页动作；不要继续发其他岗位、轮询、重启绕过或按本地成功数补发。关闭提示不解除当日阻断，按北京时间跨日后仍须显式 `browser check` 读取真实页面，正常才恢复。通用 `platform_contact_limit` 未说明周期，按平台原文处理，不承诺恢复时间。
+
 ## 统一取数：首批 10 个，后续 20 个
 
 ```text
@@ -122,7 +124,7 @@ queue 只是数据库分类查询，不派发任务；stats/report 汇总实际�
 
 正常升级替换公共 Skill 文件，保留数据、登录态与环境。旧 runtime/review-packets、current-batch 和审查 batches 文件不再被读取；无需清库或自动删除用户文件。搜索 plan confirm 仍核对实际方案，防止拿未确认的新搜索范围执行；它不使历史审查过期。发送授权不因升级或文档变化自动扩大。
 
-页面命令要求 runtime_version 16。若复用的后台版本不同，需要按下文维护并重开原 profile；只换文件不会热更新运行进程。旧目录明确配置的 initial_review_count 会保留，未指定时默认 10；用户要求改数量可用 outreach policy --initial-review-count。
+页面命令要求 runtime_version 17。若复用的后台版本不同，需要按下文维护并重开原 profile；只换文件不会热更新运行进程。旧目录明确配置的 initial_review_count 会保留，未指定时默认 10；用户要求改数量可用 outreach policy --initial-review-count。
 
 ## 暂停、关闭与故障
 

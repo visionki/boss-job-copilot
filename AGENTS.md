@@ -11,6 +11,7 @@ This repository contains a reusable Skill at `skills/boss-job-copilot/`.
 - Normal upgrades preserve user data. Never inspect or reset another workspace without a user request. Browser integration tests must use fixtures, not real recruiters.
 - Browser open/close/restart only manages the dedicated browser. Never reset or rewrite job, review or contact records on closure. Preserve actual send attempts for read-only verification. Blank pages are not login failures; explicit home navigation and bounded restart reuse the existing profile.
 - Full chat pages may omit URL identity parameters. Bind the visible company, recruiter, full job title and selected contact to the authorized contact attempt; recheck before each write. Do not mistake an identity timeout for a hung browser or retry uncertain sends. Restart defaults to BOSS home; close gracefully before forcing only verified owned processes, and verify exit before reopening.
+- Detect platform contact-limit feedback in page checks and every outreach stage. Daily limits stop page actions and report the observed platform count, never a hardcoded quota or remaining allowance inferred from local sends. Dismissing a dialog or restarting cannot clear a same-day limit; a later explicit healthy check may clear it after the China-local day changes. Preserve real contact attempts and never resend uncertain messages.
 - New public Skill files must be deliberately added to the allowlist in `scripts/package_skill.py`. Inspect file contents as well as filenames before publishing.
 
 From the repository root:

@@ -13,10 +13,10 @@ from unittest.mock import AsyncMock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from boss import parser, run
 from bosslib.local import Stopped, Store, Workspace, activity_gate, initialize, normalize
-from bosslib.page import READ_PAGE
+from bosslib.page import READ_PAGE, ContactLimitReached, page_problem
 from bosslib.outreach import DOM, DELIVERY_TIMEOUT, ChatTimeout, Outreach, delivered, send, verify, wait_chat, visible_identity_matches
 from bosslib.filters import choose_salary, load_catalog
-from bosslib.runtime import session_blocking, recoverable_collection
+from bosslib.runtime import BrowserSession, session_blocking, recoverable_collection
 
 
 class OutreachTests(unittest.IsolatedAsyncioTestCase):
@@ -137,6 +137,110 @@ class OutreachTests(unittest.IsolatedAsyncioTestCase):
         with patch('bosslib.outreach.dom', new=AsyncMock(return_value=self.view(message=message))) as dom:
             self.assertEqual((await verify(self.session, {'job_id': 'job_a'}))['status'], 'sent')
             dom.assert_awaited_once_with(self.session)
+
+    async def test_daily_contact_limit_before_contact_preserves_draft_and_stops_navigation(self):
+        request = self.approve()
+        before = list(self.store.conn.iterdump())
+        self.session.healthy_page.side_effect = ContactLimitReached({
+            'reason': 'platform_contact_limit_daily', 'daily': True, 'reported_contacts': 150})
+        with self.assertRaisesRegex(Stopped, 'platform_contact_limit_daily'):
+            await send(self.session, request)
+        self.session.action.assert_not_awaited()
+        self.assertEqual(list(self.store.conn.iterdump()), before)
+
+    async def test_daily_limit_after_contact_preserves_attempt_and_never_retries(self):
+        request = self.approve()
+        limit = {'reason': 'platform_contact_limit_daily', 'daily': True, 'reported_contacts': 150}
+        with patch('bosslib.outreach.dom', new=AsyncMock(side_effect=[self.view(), {'clicked': True}])) as dom:
+            with patch('bosslib.outreach.wait_chat', new=AsyncMock(side_effect=ContactLimitReached(limit))):
+                with self.assertRaisesRegex(Stopped, 'platform_contact_limit_daily'):
+                    await send(self.session, request)
+            self.assertEqual(dom.await_count, 2)  # No fill or send after the platform response.
+        record = self.ledger.record('job_a')
+        result = json.loads(record['result'])
+        self.assertEqual(record['status'], 'uncertain')
+        self.assertEqual(result['reason'], 'platform_contact_limit_daily')
+        self.assertEqual(result['phase'], 'waiting_chat')
+        self.assertFalse(result['send_attempted'])
+        self.assertEqual(result['contact_limit'], limit)
+        with patch('bosslib.outreach.dom', new=AsyncMock()) as dom:
+            self.assertTrue((await send(self.session, request))['skipped'])
+            dom.assert_not_awaited()
+
+    @unittest.skipUnless(os.getenv('BOSS_BROWSER_FIXTURE') == '1', 'Optional offline Chrome DOM fixture')
+    async def test_daily_limit_dialog_across_page_check_and_send_in_offline_browser(self):
+        import zendriver
+        prompt = '您已达到沟通上限\n您今天已与150位BOSS沟通，休息一下，明天再来吧~'
+        # Repeat the wording inside JD/history/input to prove they cannot be
+        # mistaken for a current platform response; the real dialog starts hidden.
+        html = '''<html><body><div class="nav-figure">离线账户</div>
+        <div class="job-detail-section"><div class="job-sec-text">''' + self.page['job_detail'] + '''</div></div>
+        <div class="company-info-box"><div class="job-sec-text">示例企业</div></div>
+        <div class="location-address">示例地址</div><div class="job-boss-info"><span class="boss-active-time">今日活跃</span></div>
+        <div class="job-detail-description">''' + prompt + '''</div><div class="message-list">''' + prompt + '''</div>
+        <textarea>''' + prompt + '''</textarea>
+        <a class="btn-startchat" redirect-url="/web/geek/chat?id=recruiter_a&jobId=job_a"
+            onclick="window.contacts=(window.contacts||0)+1;document.querySelector('#quota').style.display='block'">立即沟通</a>
+        <div id="chat-input" contenteditable="true"></div><button class="btn-send" onclick="window.sends=(window.sends||0)+1">发送</button>
+        <div id="quota" role="dialog" style="display:none"><h3>您已达到沟通上限</h3><p>您今天已与150位BOSS沟通，休息一下，明天再来吧~</p></div>
+        </body></html>'''
+        request = self.approve()
+        browser = await zendriver.start(user_data_dir=str(self.ws.profile), headless=True)
+        session = BrowserSession(self.ws)
+        session.driver, session.browser, session.tab, session.store = zendriver, browser, browser.main_tab, self.store
+        session.pace.interval = 0  # Test fixture only; production pacing is unchanged.
+        try:
+            tab = session.tab
+            async def intercept(event):
+                await tab.send(zendriver.cdp.fetch.fulfill_request(event.request_id, 200,
+                    response_headers=[zendriver.cdp.fetch.HeaderEntry('Content-Type', 'text/html; charset=utf-8')],
+                    body=base64.b64encode(html.encode()).decode()))
+            tab.add_handler(zendriver.cdp.fetch.RequestPaused, intercept)
+            await tab.send(zendriver.cdp.fetch.enable(patterns=[zendriver.cdp.fetch.RequestPattern(url_pattern='*')]))
+            await tab.get('https://www.zhipin.com/job_detail/job_a.html')
+            self.assertIsNone((await session.read())['contact_limit'])
+            self.assertEqual((await session.check())['login'], 'confirmed')
+            with self.assertRaises(ContactLimitReached) as stopped:
+                await send(session, request)
+            self.assertEqual(stopped.exception.limit['reported_contacts'], 150)
+            result = json.loads(self.ledger.record('job_a')['result'])
+            self.assertEqual(result['phase'], 'waiting_chat')
+            self.assertEqual(result['reason'], 'platform_contact_limit_daily')
+            self.assertFalse(result['send_attempted'])
+            self.assertEqual(await tab.evaluate('window.contacts || 0'), 1)
+            self.assertEqual(await tab.evaluate('window.sends || 0'), 0)
+            check = await session.check()
+            self.assertEqual(check['contact_limit']['reported_contacts'], 150)
+            self.assertEqual(check['next_action'], 'wait_until_tomorrow_then_check')
+            # A visible limit blocks all DOM writes, including a race immediately before send.
+            for op in ('read', 'contact', 'fill', 'send'):
+                view = json.loads(await tab.evaluate(DOM + '(' + json.dumps({'op': op}) + ')', return_by_value=True))
+                self.assertTrue(view['limited'])
+                self.assertEqual(view['contact_limit']['reason'], 'platform_contact_limit_daily')
+            self.assertEqual(await tab.evaluate('window.contacts || 0'), 1)
+            self.assertEqual(await tab.evaluate('window.sends || 0'), 0)
+            self.assertEqual(await tab.evaluate('document.querySelector("#chat-input").innerText'), '')
+            for text, reason, count in (
+                ('您已达到沟通上限\n您今天已与200位BOSS沟通，明天再来吧~', 'platform_contact_limit_daily', 200),
+                ('今日沟通次数已达上限', 'platform_contact_limit_daily', None),
+                ('今日打招呼机会已用完', 'platform_contact_limit_daily', None),
+                ('沟通次数已达上限', 'platform_contact_limit', None),
+                ('您已达到沟通上限', 'platform_contact_limit', None),
+                ('今日最多可沟通150位BOSS', None, None),
+            ):
+                with self.subTest(text=text):
+                    await tab.evaluate('document.querySelector("#quota").innerText=' + json.dumps(text))
+                    page = await session.read()
+                    self.assertEqual(page_problem(page), reason)
+                    if reason:
+                        self.assertEqual(page['contact_limit']['reported_contacts'], count)
+            await tab.evaluate('document.querySelector("#quota").style.display="none"')
+            self.assertIsNone((await session.read())['contact_limit'])
+            self.assertEqual((await session.check())['next_action'], 'wait_until_tomorrow_then_check')
+            with self.assertRaisesRegex(Stopped, 'manual_check_required:platform_contact_limit_daily'):
+                session.pace.delay()
+        finally:
+            await browser.stop()
 
     async def test_changed_live_jd_stops_before_contact(self):
         request = self.approve()

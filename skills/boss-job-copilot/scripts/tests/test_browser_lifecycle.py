@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -16,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from boss import close_browser, open_browser, parser, request, run, wait_browser_closed
 from bosslib.local import RUNTIME_VERSION, Stopped, Workspace, database, initialize, normalize, read_json, write_json
 from bosslib.page import page_problem
-from bosslib.runtime import BrowserSession, serve
+from bosslib.runtime import BrowserSession, Pace, serve
 from bosslib.browser_process import chrome_processes, kill_owned_chrome, process_alive
 
 
@@ -157,6 +158,32 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["login"], "not_checked")
         self.assertTrue(result["needs_manual_action"])
         self.assertEqual(read_json(self.session.pace.path)["blocked"], "verification_required")
+
+    async def test_daily_limit_persists_until_next_day_and_explicit_healthy_check(self):
+        limit = {'reason': 'platform_contact_limit_daily', 'daily': True, 'reported_contacts': 150,
+                 'text': '您已达到沟通上限；您今天已与150位BOSS沟通；明天再来'}
+        page = {'url': 'https://www.zhipin.com/job_detail/fixture.html', 'logged_in': True,
+                'text': '示例职位页面' * 30, 'contact_limit': limit}
+        # 23:59 in China, followed by the next local day without a timed retry.
+        before_midnight = datetime(2026, 1, 1, 15, 59, tzinfo=timezone.utc).timestamp()
+        self.session.read = AsyncMock(return_value=page)
+        with patch('bosslib.runtime.time.time', return_value=before_midnight):
+            result = await self.session.check()
+            self.assertEqual(result['contact_limit'], limit)
+            self.assertIn('今日沟通次数已达上限', result['user_message'])
+            self.assertEqual(result['next_action'], 'wait_until_tomorrow_then_check')
+            self.session.pace = Pace(self.ws.profile, self.ws.rate)  # Restart retains the block.
+            self.session.read.return_value = {**page, 'contact_limit': None}
+            self.assertTrue((await self.session.check())['needs_manual_action'])
+            with self.assertRaisesRegex(Stopped, 'platform_contact_limit_daily'):
+                self.session.pace.delay()
+        with patch('bosslib.runtime.time.time', return_value=before_midnight + 120):
+            with self.assertRaisesRegex(Stopped, 'platform_contact_limit_daily'):
+                self.session.pace.delay()  # A date change alone never restarts sending.
+            self.assertEqual((await self.session.check())['login'], 'confirmed')
+            self.assertNotIn('blocked', read_json(self.session.pace.path))
+            self.assertNotIn('contact_limit', read_json(self.session.pace.path))
+            self.assertEqual(self.session.pace.delay(), 0)
 
     async def test_reused_home_recovers_old_blank_block_but_not_platform_restrictions(self):
         self.session.prepare_tab = AsyncMock()

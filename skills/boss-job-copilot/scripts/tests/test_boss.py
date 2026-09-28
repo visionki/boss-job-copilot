@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from boss import open_browser, parser, request, run
 from bosslib.local import FileLock, RUNTIME_VERSION, Stopped, Workspace, database, initialize, normalize, parse_response, read_json, search_url, write_json
-from bosslib.page import detail_state, page_problem
+from bosslib.page import ContactLimitReached, detail_state, page_problem
 from bosslib.runtime import BrowserSession, Pace, serve
 from package_skill import FILES, package
 
@@ -584,6 +584,39 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
         result = read_json(self.ws.runtime / "results/work.json")
         self.assertEqual(result["state"], "completed")
         self.assertTrue(result["result"]["finished"])
+
+    async def test_worker_reports_platform_count_and_blocks_following_request(self):
+        limit = {'reason': 'platform_contact_limit_daily', 'daily': True, 'reported_contacts': 150,
+                 'text': '您已达到沟通上限；您今天已与150位BOSS沟通；明天再来'}
+        async def start():
+            await asyncio.sleep(0)  # Let the worker persist its initial session first.
+            state = read_json(self.ws.runtime / 'state.json')
+            write_json(self.ws.runtime / 'requests/first.json', {
+                'id': 'first', 'session': state['session'], 'created': time.time(), 'action': 'outreach_send'})
+        async def execute(request):
+            if request['id'] == 'first':
+                raise ContactLimitReached(limit)
+            (self.ws.runtime / 'close').touch()
+            await self.session.pace.before()
+            self.fail('The next page action must remain blocked')
+        async def followup():
+            while not (self.ws.runtime / 'results/first.json').exists():
+                await asyncio.sleep(.01)
+            state = read_json(self.ws.runtime / 'state.json')
+            write_json(self.ws.runtime / 'requests/second.json', {
+                'id': 'second', 'session': state['session'], 'created': time.time(), 'action': 'outreach_send'})
+        self.session.start = AsyncMock(side_effect=start)
+        self.session.execute = AsyncMock(side_effect=execute)
+        with patch('bosslib.runtime.BrowserSession', return_value=self.session):
+            await asyncio.wait_for(asyncio.gather(serve(self.ws.root), followup()), 5)
+        for name in ('first', 'second'):
+            result = read_json(self.ws.runtime / ('results/' + name + '.json'))
+            self.assertEqual(result['state'], 'stopped')
+            self.assertTrue(result['needs_manual_check'])
+            self.assertEqual(result['contact_limit'], limit)
+            self.assertEqual(result['next_action'], 'wait_until_tomorrow_then_check')
+            self.assertIn('今日沟通次数已达上限', result['user_message'])
+        self.assertEqual(read_json(self.session.pace.path)['blocked'], 'platform_contact_limit_daily')
 
     async def test_worker_without_deadline_still_honors_user_pause(self):
         started = asyncio.Event()

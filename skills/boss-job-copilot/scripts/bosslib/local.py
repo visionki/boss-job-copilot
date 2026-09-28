@@ -18,7 +18,7 @@ class Stopped(Exception):
     pass
 
 
-RUNTIME_VERSION = 16
+RUNTIME_VERSION = 17
 ACTIVITY_POLICY_VERSION = 2
 DEFAULT_ACTIVITY = "week"
 

@@ -6,7 +6,7 @@ import json
 import sqlite3
 import uuid
 from .local import ACTIVITY_WAITING, OUTREACH_ATTEMPTED, Stopped, activity_gate, digest, dumps, now, read_json, write_json
-from .page import detail_state, page_problem
+from .page import CONTACT_LIMIT, ContactLimitReached, contact_limit_feedback, detail_state, page_error, page_problem
 
 
 TERMINAL = OUTREACH_ATTEMPTED
@@ -207,14 +207,16 @@ DOM = r"""(args => {
     messages.push({text:normalize(text.innerText),failed,pending:!failed && !confirmed,
       id:row.getAttribute('data-id') || row.id || '',status:label,source:'startchat_modal'});
   }
+  const contactLimit = __CONTACT_LIMIT__();
   const view = {url:location.origin+location.pathname,job_id:detailJob || current.searchParams.get('jobId') || '',
     recipient: detailJob ? target?.searchParams.get('id') || '' : current.searchParams.get('id') || '',
     contact_job:target?.searchParams.get('jobId') || '',start_text:normalize(start?.innerText),
     editor:!!editor,editor_text:normalize(editor?.value ?? editor?.innerText),messages,
     surface:dialog ? 'startchat_modal' : 'chat_page',modal_rows:modalRows.length,identity,
     conversation_count:conversations.length,selected_count:selected.length,
-    limited:/今日.*(?:沟通|打招呼).*(?:上限|用完)|沟通次数已达上限/.test(document.body?.innerText || '')};
-  if (args.op === 'read') return JSON.stringify(view);
+    limited:!!contactLimit,contact_limit:contactLimit};
+  // Return the explicit platform reason before any write or target-change error.
+  if (args.op === 'read' || view.limited) return JSON.stringify(view);
   const expected=args.expected_identity || {};
   const visibleMatch=!!conversation && !!friend && ['company','recruiter','title'].every(k=>
     normalize(expected[k]) && identity[k]===normalize(expected[k])) &&
@@ -251,7 +253,7 @@ DOM = r"""(args => {
     buttons[0].click();return JSON.stringify({clicked:true});
   }
   throw new Error('unsupported_outreach_action');
-})"""
+})""".replace('__CONTACT_LIMIT__', CONTACT_LIMIT)
 
 
 async def dom(session, op="read", *, tab=None, **data):
@@ -285,7 +287,7 @@ async def dom(session, op="read", *, tab=None, **data):
         raise
     result = json.loads(raw)
     if result.get("limited"):
-        raise Stopped("platform_contact_limit")
+        raise ContactLimitReached(result['contact_limit'])
     return result
 
 
@@ -330,7 +332,7 @@ async def wait_chat(session, job_id, recipient, timeout=15, message=None, old_ta
             page = await session.read()
             problem = page_problem(page)
             if problem and problem not in ('blank_or_redirected', 'login_unconfirmed'):
-                raise Stopped(problem)
+                raise page_error(page, problem)
             candidates = [session.tab]
             if old_tabs is not None:
                 from urllib.parse import urlsplit
@@ -398,7 +400,7 @@ async def _send(session, request):
     page = await session.settle(detail_id=job_id)
     problem = page_problem(page)
     if problem:
-        raise Stopped(problem)
+        raise page_error(page, problem)
     if detail_state(page, job_id) != "complete":
         raise Stopped("detail_incomplete")
     if (page.get("chat_button") or "").strip() == "继续沟通":
@@ -477,7 +479,8 @@ async def _send(session, request):
                       else "outreach_chat_open_timeout")
         result = ledger.finish(job_id, "uncertain", {"reason": reason, **progress,
                                "observation": observation(chat, payload["message"]),
-                               "next_action": "verify_current_chat_do_not_resend"})
+                               "next_action": "verify_current_chat_do_not_resend",
+                               **contact_limit_feedback(reason, getattr(exc, 'limit', None))})
         if session_blocking(reason):
             raise
         return result
